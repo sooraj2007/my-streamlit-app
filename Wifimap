@@ -1,0 +1,388 @@
+import re
+import sqlite3
+import subprocess
+from datetime import datetime
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# ---------------- App configuration ----------------
+
+st.set_page_config(
+    page_title="WiFiMap",
+    page_icon="📶",
+    layout="wide",
+)
+
+DB = "wifimap.db"
+
+
+# ---------------- Database ----------------
+
+def setup_database():
+    """Create the readings table if it does not already exist."""
+    with sqlite3.connect(DB) as con:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                time TEXT,
+                ssid TEXT,
+                row_no INTEGER,
+                col_no INTEGER,
+                rssi INTEGER
+            )
+            """
+        )
+
+
+def save_reading(ssid, row_no, col_no, rssi):
+    """Save one Wi-Fi signal measurement to the database."""
+    with sqlite3.connect(DB) as con:
+        con.execute(
+            """
+            INSERT INTO readings
+            (time, ssid, row_no, col_no, rssi)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ssid,
+                int(row_no),
+                int(col_no),
+                int(rssi),
+            ),
+        )
+
+
+def load_readings():
+    """Load all saved readings into a DataFrame."""
+    with sqlite3.connect(DB) as con:
+        return pd.read_sql_query(
+            "SELECT * FROM readings ORDER BY id",
+            con,
+        )
+
+
+def clear_readings():
+    """Delete all stored readings."""
+    with sqlite3.connect(DB) as con:
+        con.execute("DELETE FROM readings")
+
+
+# ---------------- Wi-Fi detection ----------------
+
+def detect_wifi():
+    """
+    Detect the connected Wi-Fi network on Windows.
+
+    Returns:
+        ssid: Connected network name.
+        rssi: Estimated RSSI in dBm.
+        percent: Windows signal percentage.
+    """
+    try:
+        result = subprocess.check_output(
+            ["netsh", "wlan", "show", "interfaces"],
+            text=True,
+            errors="ignore",
+        )
+
+        ssid_match = re.search(
+            r"^\s*SSID\s*:\s*(.+)$",
+            result,
+            re.MULTILINE | re.IGNORECASE,
+        )
+
+        signal_match = re.search(
+            r"^\s*Signal\s*:\s*(\d+)%",
+            result,
+            re.MULTILINE | re.IGNORECASE,
+        )
+
+        if ssid_match and signal_match:
+            ssid = ssid_match.group(1).strip()
+            percent = int(signal_match.group(1))
+
+            # Approximate conversion from Windows signal percentage to dBm.
+            estimated_rssi = round(percent / 2 - 100)
+
+            return ssid, estimated_rssi, percent
+
+    except Exception:
+        pass
+
+    return "Unknown", None, None
+
+
+def classify_signal(rssi):
+    """Classify RSSI strength into a human-readable category."""
+    if rssi >= -50:
+        return "Excellent"
+    elif rssi >= -60:
+        return "Good"
+    elif rssi >= -70:
+        return "Fair"
+    elif rssi >= -80:
+        return "Weak"
+    return "Very Weak"
+
+
+# ---------------- Initialize app ----------------
+
+setup_database()
+
+st.title("📶 WiFiMap")
+st.subheader("Smart Wi-Fi Dead Zone Detection System")
+
+st.write(
+    "Identify weak Wi-Fi signal areas using signal measurements "
+    "and an interactive coverage heatmap."
+)
+
+ssid, detected_rssi, signal_percent = detect_wifi()
+
+
+# ---------------- Current Wi-Fi information ----------------
+
+st.header("1. Current Wi-Fi Information")
+
+if detected_rssi is not None:
+    st.success(f"Connected Network: {ssid}")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric("Estimated Signal", f"{detected_rssi} dBm")
+
+    with col2:
+        st.metric("Signal Percentage", f"{signal_percent}%")
+
+    with col3:
+        st.metric("Signal Quality", classify_signal(detected_rssi))
+
+    st.caption(
+        "Note: The dBm value is estimated from the Windows signal percentage. "
+        "Windows does not directly provide the exact RSSI through this command."
+    )
+
+else:
+    st.warning(
+        "Automatic Wi-Fi detection is unavailable. "
+        "You can still record manual RSSI measurements."
+    )
+
+
+# ---------------- Floor plan settings ----------------
+
+st.header("2. Record Signal Measurement")
+
+rows = st.number_input(
+    "Floor-plan rows",
+    min_value=2,
+    max_value=10,
+    value=5,
+    step=1,
+    key="floor_rows",
+)
+
+cols = st.number_input(
+    "Floor-plan columns",
+    min_value=2,
+    max_value=10,
+    value=5,
+    step=1,
+    key="floor_cols",
+)
+
+with st.form("measurement_form"):
+    row = st.number_input(
+        "Select Row",
+        min_value=1,
+        max_value=int(rows),
+        value=1,
+        step=1,
+        key="selected_row",
+    )
+
+    col = st.number_input(
+        "Select Column",
+        min_value=1,
+        max_value=int(cols),
+        value=1,
+        step=1,
+        key="selected_col",
+    )
+
+    use_auto = st.checkbox(
+        "Use detected Wi-Fi reading",
+        value=detected_rssi is not None,
+        disabled=detected_rssi is None,
+        key="use_auto_reading",
+    )
+
+    manual_rssi = st.slider(
+        "Manual RSSI (dBm)",
+        min_value=-100,
+        max_value=-30,
+        value=-65,
+        step=1,
+        key="manual_rssi",
+    )
+
+    save_clicked = st.form_submit_button("Save Measurement")
+
+if save_clicked:
+    if use_auto and detected_rssi is not None:
+        rssi_value = detected_rssi
+        network_name = ssid
+    else:
+        rssi_value = manual_rssi
+        network_name = "Manual Entry"
+
+    save_reading(
+        ssid=network_name,
+        row_no=row,
+        col_no=col,
+        rssi=rssi_value,
+    )
+
+    st.toast("Measurement saved successfully!", icon="✅")
+
+
+# ---------------- Coverage heatmap ----------------
+
+st.header("3. Wi-Fi Coverage Heatmap")
+
+df = load_readings()
+
+if not df.empty:
+    # Keep only the latest measurement for each grid cell.
+    latest_readings = df.groupby(["row_no", "col_no"], as_index=False).tail(1)
+
+    # Create an empty signal grid.
+    grid = np.full((int(rows), int(cols)), np.nan)
+
+    for _, reading in latest_readings.iterrows():
+        r = int(reading["row_no"]) - 1
+        c = int(reading["col_no"]) - 1
+
+        if 0 <= r < int(rows) and 0 <= c < int(cols):
+            grid[r, c] = reading["rssi"]
+
+    valid_cells = np.isfinite(grid)
+
+    if valid_cells.any():
+        fig, ax = plt.subplots(figsize=(9, 5))
+
+        image = ax.imshow(
+            np.ma.masked_invalid(grid),
+            cmap="RdYlGn",
+            vmin=-90,
+            vmax=-40,
+            origin="upper",
+        )
+
+        ax.set_title("Wi-Fi Signal Coverage Map")
+        ax.set_xlabel("Columns / Zones")
+        ax.set_ylabel("Rows / Zones")
+
+        ax.set_xticks(np.arange(int(cols)))
+        ax.set_yticks(np.arange(int(rows)))
+
+        ax.set_xticklabels([str(i + 1) for i in range(int(cols))])
+        ax.set_yticklabels([str(i + 1) for i in range(int(rows))])
+
+        for r in range(int(rows)):
+            for c in range(int(cols)):
+                if valid_cells[r, c]:
+                    label = f"{grid[r, c]:.0f} dBm"
+                    text_color = "black"
+                else:
+                    label = "No Data"
+                    text_color = "gray"
+
+                ax.text(
+                    c,
+                    r,
+                    label,
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color=text_color,
+                )
+
+        fig.colorbar(image, ax=ax, label="Signal Strength (dBm)")
+
+        st.pyplot(fig)
+        plt.close(fig)
+
+    else:
+        st.info(
+            "No saved readings fall inside the current floor-plan size. "
+            "Increase the rows/columns or record new measurements."
+        )
+
+    # Weak coverage analysis
+    weak_threshold = -70
+    weak_locations = latest_readings[
+        latest_readings["rssi"] < weak_threshold
+    ]
+
+    metric_col1, metric_col2, metric_col3 = st.columns(3)
+
+    with metric_col1:
+        st.metric("Total Measurements", len(df))
+
+    with metric_col2:
+        st.metric("Unique Locations", len(latest_readings))
+
+    with metric_col3:
+        st.metric("Weak Signal Locations", len(weak_locations))
+
+    if not weak_locations.empty:
+        st.warning("Weak Wi-Fi coverage detected!")
+
+        st.dataframe(
+            weak_locations[
+                ["time", "ssid", "row_no", "col_no", "rssi"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    else:
+        st.success("No recorded weak locations!")
+
+else:
+    st.info("Record measurements to generate your heatmap.")
+
+
+# ---------------- Measurement history ----------------
+
+if not df.empty:
+    st.header("4. Measurement History")
+
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    download_col, clear_col = st.columns([3, 1])
+
+    with download_col:
+        st.download_button(
+            label="Download CSV Report",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name="wifi_readings.csv",
+            mime="text/csv",
+            key="download_csv",
+        )
+
+    with clear_col:
+        if st.button("Clear All Readings", key="clear_readings"):
+            clear_readings()
+            st.rerun()
